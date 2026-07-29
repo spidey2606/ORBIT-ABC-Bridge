@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ORBIT–BC Bridge
 // @namespace    orbit-ba-bridge
-// @version      3.3.0
+// @version      2.6.0
 // @description  One-click: extract customer query → send to BC → paste response into Expected Response
 // @author       piyushts
 // @match        https://*.harmony.a2z.com/*
@@ -17,13 +17,11 @@
 (function () {
   'use strict';
 
-  const VERSION = '3.3.0';
+  const VERSION = '3.6.0';
   console.log('[ORBIT Bridge ' + VERSION + '] loaded on:', location.href);
 
   const SEL = {
-    QUERY_SELECTED : '#conversation-display > div.message.customer.selected > div.message-bubble',
-    QUERY_ALL      : '#conversation-display > div.message.customer > div.message-bubble',
-    EXPECTED       : 'textarea[placeholder*="expected" i]',
+    EXPECTED       : 'textarea[placeholder*="expected response" i]',
     BA_INPUT       : [
       'textarea[name="messageInput"]',
       'textarea[placeholder*="message" i]',
@@ -52,10 +50,10 @@
   const KEY_CMD        = 'orbit_ba_cmd';
   const TOOLBAR_ID  = 'orbit-bridge-toolbar-v120';
 
-  const IS_ANNOTATOR = /harmony\.a2z\.com/.test(location.host);
+  const IS_ANNOTATOR = /harmony\.a2z\.com/.test(location.host) && /\/reviewer($|\?|#)/.test(location.pathname);
   const IS_BA        = /pre-prod\.amazon\.com/.test(location.host);
 
-  console.log('[ORBIT Bridge ' + VERSION + '] page: ' + (IS_ANNOTATOR ? 'ANNOTATOR' : IS_BA ? 'BA' : 'none'));
+  console.log('[ORBIT Bridge ' + VERSION + '] page: ' + (IS_ANNOTATOR ? 'ANNOTATOR (abc-mlops)' : IS_BA ? 'BA' : 'none'));
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -685,10 +683,14 @@
     cancelBtn.addEventListener('click',    () => { showFetchPane(); setSBar('Cancelled', 'err'); setStatus('\u26A0\uFE0F Request cancelled', 'warn'); });
     useBtn.addEventListener('click',       async () => {
       const _respText = document.getElementById('ob-resp-text').value;
-      // Re-select the original message if user navigated away while BC was fetching
-      if (_anchorRow && _anchorRow.isConnected && !_anchorRow.classList.contains('selected')) {
-        _anchorRow.click();
-        await sleep(400);
+      // If the user moved to a different turn while BC was fetching, click back to
+      // the original turn's badge wrapper so the Expected Response textarea is correct.
+      if (_anchorRow && _anchorRow.isConnected) {
+        const _stillActive = _anchorRow.querySelector('span[class*="badge-color-blue"]');
+        if (!_stillActive) {
+          (_anchorRow.querySelector('span') || _anchorRow).click();
+          await sleep(500);
+        }
       }
       _anchorRow = null;
       pasteResponse(_respText);
@@ -806,7 +808,11 @@
       setStatus('\u26A0\uFE0F No customer query found \u2014 select a message first.', 'err');
       return;
     }
-        _anchorRow = document.querySelector('#conversation-display > div.message.customer.selected');
+    // Capture the active turn's badge wrapper so 'Use this' pastes into the correct message
+    // even if the user navigates to a different turn while BC is fetching.
+    { const _ab = [...document.querySelectorAll('span[class*="badge-color-blue"]')]
+        .find(el => el.textContent.includes('Annotating'));
+      _anchorRow = _ab ? _ab.parentElement : null; }
     showBusyPane('Waiting for BC response\u2026');
     setStatus('', '');
     await dispatchToBC(queries, mode);
@@ -875,22 +881,82 @@
       setStatus('\u26A0\uFE0F Query box is empty.', 'err');
       return;
     }
-        _anchorRow = document.querySelector('#conversation-display > div.message.customer.selected');
+    { const _ab = [...document.querySelectorAll('span[class*="badge-color-blue"]')]
+        .find(el => el.textContent.includes('Annotating'));
+      _anchorRow = _ab ? _ab.parentElement : null; }
     showBusyPane('Sending queries to BC\u2026');
     setStatus('', '');
     await dispatchToBC(queries, mode);
   }
 
+  // ── abc-mlops reviewer: extract customer queries from new UI ────────────────
+  // Structure per turn: DIV("Customer") → SPAN badge(s) → DIV(query) → DIV(bot response)
+  // Active turn is the one whose badge contains "← Annotating" (badge-color-blue)
+
+  // DOM structure per turn:
+  //   <div>Customer</div>
+  //   <div>                          ← badge wrapper (no class, only SPAN badges inside)
+  //     <span badge-grey>Not annotated</span>
+  //     <span badge-blue>← Annotating</span>   ← active turn
+  //   </div>
+  //   <div>customer query text</div>  ← nextSibling of badge wrapper
+  //   <div>bot response text</div>
+
+  function _queryFromBadgeWrapper(wrapper) {
+    // wrapper = the bare DIV containing the badge SPANs
+    // customer query = next non-empty sibling DIV after the wrapper
+    let el = wrapper.nextElementSibling;
+    while (el) {
+      const text = el.textContent.trim();
+      if (text && text !== 'Customer') return text;
+      el = el.nextElementSibling;
+    }
+    return null;
+  }
+
+  function getActiveCustomerQuery() {
+    // Find the blue ← Annotating badge
+    const badge = [...document.querySelectorAll('span[class*="badge-color-blue"]')]
+      .find(el => el.textContent.includes('Annotating'));
+    if (!badge) return null;
+    // badge.parentElement = the badge wrapper DIV
+    return _queryFromBadgeWrapper(badge.parentElement);
+  }
+
+  function getAllQueriesUpToActive() {
+    // Find all badge-wrapper DIVs (bare DIV whose children are all SPAN badges)
+    // Each such wrapper corresponds to one customer turn
+    const queries = [];
+
+    // Collect all blue + grey badge wrappers in document order
+    const allBadgeWrappers = [...document.querySelectorAll('div')].filter(d => {
+      if (d.className) return false; // must be unstyled
+      const kids = [...d.children];
+      return kids.length >= 1 && kids.every(c => c.tagName === 'SPAN' && c.className?.includes('badge'));
+    });
+
+    for (const wrapper of allBadgeWrappers) {
+      const isActive = [...wrapper.querySelectorAll('span[class*="badge-color-blue"]')]
+        .some(el => el.textContent.includes('Annotating'));
+      const queryText = _queryFromBadgeWrapper(wrapper);
+      if (queryText) queries.push(queryText);
+      if (isActive) break;
+    }
+
+    if (!queries.length) {
+      const q = getActiveCustomerQuery();
+      if (q) return [q];
+    }
+    return queries;
+  }
+
   function extractQueries(mode) {
     if (mode === 'single') {
-      const el = document.querySelector(SEL.QUERY_SELECTED);
-      const text = el?.textContent?.trim();
-      return text ? [text] : [];
+      const q = getActiveCustomerQuery();
+      return q ? [q] : [];
     } else {
-      const allRows = Array.from(document.querySelectorAll('#conversation-display > div.message.customer'));
-      const selectedIdx = allRows.findIndex(row => row.classList.contains('selected'));
-      const rows = selectedIdx === -1 ? allRows : allRows.slice(0, selectedIdx + 1);
-      return rows.map(row => row.querySelector('div.message-bubble')?.textContent?.trim()).filter(Boolean);
+      const qs = getAllQueriesUpToActive();
+      return qs.length ? qs : (function(){ const q = getActiveCustomerQuery(); return q ? [q] : []; })();
     }
   }
 
